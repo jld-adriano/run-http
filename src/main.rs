@@ -1,5 +1,5 @@
 use actix_web::{middleware, web, App, HttpResponse, HttpServer, Responder};
-use clap::Parser;
+use clap::{Parser, ArgAction};
 use futures::StreamExt;
 use log::{error, info};
 use std::process::Stdio;
@@ -20,6 +20,9 @@ struct Args {
 
     #[clap(last = true, required = true)]
     command: Vec<String>,
+
+    #[clap(long, action = ArgAction::SetTrue, hide = true)]
+    markdown_help: bool,
 }
 
 struct AppState {
@@ -159,10 +162,16 @@ async fn get_status(data: web::Data<Arc<AppState>>) -> impl Responder {
 
 #[actix_web::main]
 async fn main() -> std::io::Result<()> {
+    let args = Args::parse();
+
+    if args.markdown_help {
+        clap_markdown::print_help_markdown::<Args>();
+        return Ok(());
+    }
+
     env_logger::init_from_env(env_logger::Env::new().default_filter_or("info"));
 
     info!("\n\n\nBooting up...");
-    let args = Args::parse();
     let (tx, mut rx) = mpsc::channel(100);
 
     let app_state = Arc::new(AppState {
