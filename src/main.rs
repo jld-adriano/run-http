@@ -10,18 +10,24 @@ use tokio::sync::mpsc;
 use tokio_stream::wrappers::LinesStream;
 
 #[derive(Parser, Debug)]
-#[clap(author, version, about, long_about = None, disable_help_flag = true)]
+#[clap(
+    author = "jld.adriano@gmail.com",
+    version = "0.1.0",
+    about = "A CLI tool to run and control commands via http",
+    long_about = None,
+    disable_help_flag = true
+)]
 struct Args {
-    #[clap(short, long, default_value = "30067")]
+    #[clap(short, long, default_value = "30067", help = "Port to run the web server on")]
     port: u16,
 
-    #[clap(short, long, default_value = "127.0.0.1")]
+    #[clap(short, long, default_value = "127.0.0.1", help = "Host address to bind the web server to")]
     host: String,
 
-    #[clap(last = true, required = true)]
+    #[clap(last = true, required = true, help = "The command to run and monitor")]
     command: Vec<String>,
 
-    #[clap(long, action = ArgAction::SetTrue, hide = true)]
+    #[clap(long, action = ArgAction::SetTrue, hide = true, help = "Generate markdown help")]
     markdown_help: bool,
 }
 
@@ -166,6 +172,14 @@ async fn main() -> std::io::Result<()> {
 
     if args.markdown_help {
         clap_markdown::print_help_markdown::<Args>();
+        println!("# Examples\n");
+        println!("```");
+        println!("run-http -- python -c 'import time; i=0; while True: print(f\"Count: {{i}}\"); i+=1; time.sleep(1)'");
+        println!("curl http://localhost:30067/start");
+        println!("curl http://localhost:30067/status");
+        println!("curl http://localhost:30067/stop");
+        println!("curl http://localhost:30067/restart");
+        println!("```");
         return Ok(());
     }
 
