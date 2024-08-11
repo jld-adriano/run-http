@@ -21,7 +21,7 @@ A CLI tool to run and control commands via http
 * `-p`, `--port <PORT>` — Port to run the web server on
 
   Default value: `30067`
-* `-h`, `--host <HOST>` — Host address to bind the web server to
+* `--host <HOST>` — Host address to bind the web server to
 
   Default value: `127.0.0.1`
 * `--restart-condition <RESTART_CONDITION>` — Condition command to run before restarting

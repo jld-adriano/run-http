@@ -15,14 +15,13 @@ use tokio::time::{sleep, Duration};
     author = "jld.adriano@gmail.com",
     version = "0.1.0",
     about = "A CLI tool to run and control commands via http",
-    long_about = None,
-    disable_help_flag = true
+    long_about = None
 )]
 struct Args {
     #[clap(short, long, default_value = "30067", help = "Port to run the web server on")]
     port: u16,
 
-    #[clap(short, long, default_value = "127.0.0.1", help = "Host address to bind the web server to")]
+    #[clap(long, default_value = "127.0.0.1", help = "Host address to bind the web server to")]
     host: String,
 
     #[clap(last = true, required = true, help = "The command to run and monitor")]
