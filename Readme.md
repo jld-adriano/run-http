@@ -24,6 +24,11 @@ A CLI tool to run and control commands via http
 * `-h`, `--host <HOST>` — Host address to bind the web server to
 
   Default value: `127.0.0.1`
+* `--restart-condition <RESTART_CONDITION>` — Condition command to run before restarting
+* `--fail-atleast-once` — Ensure restart condition fails at least once before passing
+* `--restart-condition-sleep <RESTART_CONDITION_SLEEP>` — Sleep duration in milliseconds between restart condition checks
+
+  Default value: `300`
 
 
 

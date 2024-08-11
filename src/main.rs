@@ -8,6 +8,7 @@ use tokio::io::{AsyncBufReadExt, BufReader};
 use tokio::process::{Child, Command as TokioCommand};
 use tokio::sync::mpsc;
 use tokio_stream::wrappers::LinesStream;
+use tokio::time::{sleep, Duration};
 
 #[derive(Parser, Debug)]
 #[clap(
@@ -29,12 +30,24 @@ struct Args {
 
     #[clap(long, action = ArgAction::SetTrue, hide = true, help = "Generate markdown help")]
     markdown_help: bool,
+
+    #[clap(long, help = "Condition command to run before restarting")]
+    restart_condition: Option<String>,
+
+    #[clap(long, action = ArgAction::SetTrue, help = "Ensure restart condition fails at least once before passing")]
+    fail_atleast_once: bool,
+
+    #[clap(long, default_value = "300", help = "Sleep duration in milliseconds between restart condition checks")]
+    restart_condition_sleep: u64,
 }
 
 struct AppState {
     command: Vec<String>,
     child_process: Mutex<Option<Child>>,
     output_tx: mpsc::Sender<String>,
+    restart_condition: Option<String>,
+    fail_atleast_once: bool,
+    restart_condition_sleep: u64,
 }
 
 async fn run_command(
@@ -117,8 +130,38 @@ async fn monitor_child(data: web::Data<Arc<AppState>>) {
     }
 }
 
+async fn run_restart_condition(condition: &str) -> bool {
+    let output = TokioCommand::new("sh")
+        .arg("-c")
+        .arg(condition)
+        .output()
+        .await;
+
+    match output {
+        Ok(output) => output.status.success(),
+        Err(_) => false,
+    }
+}
+
 async fn restart_command(data: web::Data<Arc<AppState>>) -> impl Responder {
     info!("Received request to restart command");
+    
+    if let Some(condition) = &data.restart_condition {
+        let mut has_failed = !data.fail_atleast_once;
+        loop {
+            info!("Checking restart condition: {}", condition);
+            let condition_result = run_restart_condition(condition).await;
+            if !condition_result {
+                has_failed = true;
+            }
+            if condition_result && (!data.fail_atleast_once || has_failed) {
+                info!("Restart condition met");
+                break;
+            }
+            sleep(Duration::from_millis(data.restart_condition_sleep)).await;
+        }
+    }
+
     let mut child_process = data.child_process.lock().unwrap();
     if let Some(mut child) = child_process.take() {
         info!("Killing existing child process");
@@ -192,6 +235,9 @@ async fn main() -> std::io::Result<()> {
         command: args.command.clone(),
         child_process: Mutex::new(None),
         output_tx: tx.clone(),
+        restart_condition: args.restart_condition,
+        fail_atleast_once: args.fail_atleast_once,
+        restart_condition_sleep: args.restart_condition_sleep,
     });
 
     tokio::spawn(async move {
