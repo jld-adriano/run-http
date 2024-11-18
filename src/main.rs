@@ -9,6 +9,7 @@ use tokio::process::{Child, Command as TokioCommand};
 use tokio::sync::mpsc;
 use tokio_stream::wrappers::LinesStream;
 use tokio::time::{sleep, Duration};
+use actix_web::body::MessageBody;
 
 #[derive(Parser, Debug)]
 #[clap(
@@ -118,14 +119,72 @@ async fn start_command(data: web::Data<Arc<AppState>>) -> Result<HttpResponse, a
 }
 
 async fn monitor_child(data: web::Data<Arc<AppState>>) {
-    let mut child = data.child_process.lock().unwrap().take().unwrap();
-    let status = child.wait().await.unwrap();
-    println!("Command exited with status: {:?}", status);
-    if !status.success() {
-        let _ = data
-            .output_tx
-            .send(format!("Command exited with error: {:?}", status))
-            .await;
+    // First get the child process (if any) and take ownership of it
+    let child = {
+        let mut guard = data.child_process.lock().unwrap();
+        info!("Monitor - Getting child process, current state: {:?}", guard.is_some());
+        // Instead of taking immediately, let's wait until the process exits
+        guard.as_mut()
+            .map(|child| child.id())
+    };
+    
+    match child {
+        Some(pid) => {
+            info!("Monitor - Found child process with PID: {:?}", pid);
+            
+            // Now wait for the process to exit
+            let mut final_status = None;
+            loop {
+                let should_break = {
+                    let mut guard = data.child_process.lock().unwrap();
+                    if let Some(child) = guard.as_mut() {
+                        match child.try_wait() {
+                            Ok(Some(status)) => {
+                                info!("Monitor - Child process exited with status: {:?}", status);
+                                // Only take the process if it has exited
+                                *guard = None;
+                                final_status = Some(status);
+                                true
+                            }
+                            Ok(None) => {
+                                info!("Monitor - Child process still running");
+                                false
+                            }
+                            Err(e) => {
+                                error!("Monitor - Error checking process status: {}", e);
+                                false
+                            }
+                        }
+                    } else {
+                        info!("Monitor - Child process no longer in state");
+                        true
+                    }
+                };
+
+                if should_break {
+                    break;
+                }
+                sleep(Duration::from_millis(100)).await;
+            }
+            
+            info!("Monitor - Finished monitoring process with final status: {:?}", final_status);
+
+            // Send error message if needed
+            if let Some(status) = final_status {
+                if !status.success() {
+                    let _ = data
+                        .output_tx
+                        .send(format!("Command exited with error: {:?}", status))
+                        .await;
+                }
+            }
+        }
+        None => {
+            info!("Monitor - No child process found to monitor");
+            let msg = "Error: No child process found to monitor".to_string();
+            error!("{}", msg);
+            let _ = data.output_tx.send(msg).await;
+        }
     }
 }
 
@@ -182,16 +241,25 @@ async fn restart_command(data: web::Data<Arc<AppState>>) -> impl Responder {
 }
 
 async fn stop_command(data: web::Data<Arc<AppState>>) -> impl Responder {
-    info!("Received request to stop command");
+    info!("Stop - Received request to stop command");
     let mut child_process = data.child_process.lock().unwrap();
+    info!("Stop - Got lock, child process state: {:?}", child_process.is_some());
+    
     if let Some(mut child) = child_process.take() {
-        info!("Killing child process");
-        let _ = child.kill();
-        let _ = child.wait();
-        info!("Command stopped successfully");
+        info!("Stop - Found child process, attempting to kill");
+        let pid = child.id();
+        info!("Stop - Child PID: {:?}", pid);
+        
+        // Await the kill operation before checking result
+        let kill_result = child.kill().await.is_ok();
+        info!("Stop - Kill result: {}", kill_result);
+        
+        let wait_result = child.wait().await;
+        info!("Stop - Wait result: {:?}", wait_result);
+        info!("Stop - Command stopped successfully");
         HttpResponse::Ok().body("Command stopped successfully")
     } else {
-        info!("No command is running");
+        info!("Stop - No command is running");
         HttpResponse::BadRequest().body("No command is running")
     }
 }
@@ -287,5 +355,211 @@ async fn main() -> std::io::Result<()> {
             error!("Failed to bind to {}: {}", bind_address, e);
             Err(e)
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use tokio::runtime::Runtime;
+    use actix_web::test::TestRequest;
+
+    // Helper function to get response body as string
+    async fn get_body_as_string(resp: impl Responder) -> String {
+        let req = TestRequest::get().to_http_request();
+        let response = resp.respond_to(&req);
+        if let Ok(bytes) = response.into_body().try_into_bytes() {
+            String::from_utf8(bytes.to_vec()).unwrap_or_default()
+        } else {
+            String::new()
+        }
+    }
+
+    async fn setup_test_state() -> web::Data<Arc<AppState>> {
+        let (tx, _rx) = mpsc::channel(100);
+        let state = Arc::new(AppState {
+            command: vec!["echo".to_string(), "test".to_string()],
+            child_process: Mutex::new(None),
+            output_tx: tx,
+            restart_condition: None,
+            fail_atleast_once: false,
+            restart_condition_sleep: 100,
+        });
+        web::Data::new(state)
+    }
+
+    #[test]
+    fn test_start_stop_command() {
+        let rt = create_runtime();
+        rt.block_on(async {
+            let state = setup_test_state().await;
+            
+            info!("Test - Starting long running command");
+            let command = vec!["sleep".to_string(), "2".to_string()];
+            let child = run_command(&command, state.output_tx.clone())
+                .await
+                .expect("Failed to start sleep command");
+            
+            info!("Test - Setting child process");
+            {
+                let mut lock = state.child_process.lock().unwrap();
+                info!("Test - Got lock, current state: {:?}", lock.is_some());
+                *lock = Some(child);
+                info!("Test - Child process set, new state: {:?}", lock.is_some());
+            }
+            
+            info!("Test - Spawning monitor");
+            tokio::spawn(monitor_child(state.clone()));
+            
+            // Give the command a moment to start
+            info!("Test - Waiting for command to start");
+            sleep(Duration::from_millis(100)).await;
+            
+            // Verify command is running
+            info!("Test - Checking status");
+            {
+                let lock = state.child_process.lock().unwrap();
+                info!("Test - Child process state before status check: {:?}", lock.is_some());
+            }
+            let status_resp = get_status(state.clone()).await;
+            let status_body = get_body_as_string(status_resp).await;
+            info!("Test - Status response: {}", status_body);
+            assert!(status_body.contains("running"), "Command should be running");
+            
+            // Test stopping
+            info!("Test - Attempting to stop command");
+            {
+                let lock = state.child_process.lock().unwrap();
+                info!("Test - Child process state before stop: {:?}", lock.is_some());
+            }
+            let stop_resp = stop_command(state.clone()).await;
+            let stop_body = get_body_as_string(stop_resp).await;
+            info!("Test - Stop command response: {}", stop_body);
+            assert!(stop_body.contains("successfully"), "Stop command failed: {}", stop_body);
+            
+            // Give the command a moment to stop
+            info!("Test - Waiting for command to stop");
+            sleep(Duration::from_millis(100)).await;
+            
+            // Verify command is stopped
+            info!("Test - Verifying command is stopped");
+            {
+                let lock = state.child_process.lock().unwrap();
+                info!("Test - Child process state before final check: {:?}", lock.is_some());
+            }
+            let status_resp = get_status(state.clone()).await;
+            let status_body = get_body_as_string(status_resp).await;
+            info!("Test - Final status: {}", status_body);
+            assert!(status_body.contains("not running"), "Command should not be running");
+        });
+    }
+
+    #[test]
+    fn test_restart_with_condition() {
+        let rt = create_runtime();
+        rt.block_on(async {
+            let (tx, mut rx) = mpsc::channel(100);
+            
+            let state = Arc::new(AppState {
+                command: vec!["echo".to_string(), "test".to_string()],
+                child_process: Mutex::new(None),
+                output_tx: tx,
+                restart_condition: Some("exit 0".to_string()),
+                fail_atleast_once: false,
+                restart_condition_sleep: 100,
+            });
+            let state = web::Data::new(state);
+
+            // Start command
+            let _ = start_command(state.clone()).await;
+            
+            // Test restart
+            let restart_body = get_body_as_string(restart_command(state.clone()).await).await;
+            assert!(restart_body.contains("successfully"));
+
+            // Check output
+            while let Ok(msg) = rx.try_recv() {
+                if msg.contains("successfully") {
+                    return;
+                }
+            }
+        });
+    }
+
+    #[test]
+    fn test_long_running_command() {
+        let rt = create_runtime();
+        rt.block_on(async {
+            let state = setup_test_state().await;
+            
+            // Start a long-running command
+            let command = vec!["sleep".to_string(), "1".to_string()];
+            let child = run_command(&command, state.output_tx.clone())
+                .await
+                .expect("Failed to start sleep command");
+            
+            *state.child_process.lock().unwrap() = Some(child);
+            tokio::spawn(monitor_child(state.clone()));
+
+            // Give the command a moment to start
+            sleep(Duration::from_millis(100)).await;
+
+            // Verify it's running
+            let status_body = get_body_as_string(get_status(state.clone()).await).await;
+            assert!(status_body.contains("running"), "Command should be running initially");
+
+            // Wait for finish
+            sleep(Duration::from_millis(1200)).await;  // Wait longer than the sleep command
+
+            let status_body = get_body_as_string(get_status(state.clone()).await).await;
+            assert!(status_body.contains("not running"), "Command should have finished");
+        });
+    }
+
+    #[test]
+    fn test_cli_args() {
+        let args = Args::parse_from([
+            "run-http",
+            "--port",
+            "8080",
+            "--host",
+            "127.0.0.1",
+            "--",
+            "echo",
+            "hello"
+        ]);
+
+        assert_eq!(args.port, 8080);
+        assert_eq!(args.host, "127.0.0.1");
+        assert_eq!(args.command, vec!["echo", "hello"]);
+        assert_eq!(args.fail_atleast_once, false);
+        assert_eq!(args.restart_condition_sleep, 300);
+        assert_eq!(args.restart_condition, None);
+    }
+
+    #[test]
+    fn test_cli_restart_condition() {
+        let args = Args::parse_from([
+            "run-http",
+            "--restart-condition",
+            "test -f file.txt",
+            "--fail-atleast-once",
+            "--restart-condition-sleep",
+            "100",
+            "--",
+            "echo",
+            "hello"
+        ]);
+
+        assert_eq!(args.restart_condition.unwrap(), "test -f file.txt");
+        assert_eq!(args.fail_atleast_once, true);
+        assert_eq!(args.restart_condition_sleep, 100);
+    }
+
+    fn create_runtime() -> Runtime {
+        tokio::runtime::Builder::new_multi_thread()
+            .enable_all()
+            .build()
+            .unwrap()
     }
 }
