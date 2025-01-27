@@ -58,7 +58,6 @@ async fn run_command(
     command: &[String],
     tx: mpsc::Sender<String>,
 ) -> Result<Child, std::io::Error> {
-    println!("Running command: {:?}", command);
     let mut child = TokioCommand::new(&command[0])
         .args(&command[1..])
         .stdout(Stdio::piped())
@@ -109,22 +108,22 @@ async fn start_command(data: web::Data<Arc<AppState>>) -> Result<HttpResponse, a
             *data.child_process.lock().unwrap() = Some(child);
             if !data.quiet {
                 info!("Command started successfully, monitoring child");
+                let _ = data
+                    .output_tx
+                    .send("Command started successfully".to_string())
+                    .await;
             }
             tokio::spawn(monitor_child(data.clone()));
-            let _ = data
-                .output_tx
-                .send("Command started successfully".to_string())
-                .await;
             Ok(HttpResponse::Ok().body("Command started successfully"))
         }
         Err(e) => {
             if !data.quiet {
                 error!("Failed to start command: {}", e);
+                let _ = data
+                    .output_tx
+                    .send(format!("Failed to start command: {}", e))
+                    .await;
             }
-            let _ = data
-                .output_tx
-                .send(format!("Failed to start command: {}", e))
-                .await;
             Ok(HttpResponse::InternalServerError().body(format!("Failed to start command: {}", e)))
         }
     }
@@ -369,7 +368,11 @@ async fn main() -> std::io::Result<()> {
 
     tokio::spawn(async move {
         while let Some(line) = rx.recv().await {
-            println!("Output: {}", line);
+            if args.quiet {
+                print!("{}", line);  // Direct passthrough in quiet mode
+            } else {
+                println!("Output: {}", line);
+            }
         }
     });
 
@@ -377,22 +380,28 @@ async fn main() -> std::io::Result<()> {
     match run_command(&args.command, tx.clone()).await {
         Ok(child) => {
             *app_state.child_process.lock().unwrap() = Some(child);
-            info!("Command started successfully on boot");
-            let _ = tx
-                .send("Command started successfully on boot".to_string())
-                .await;
+            if !args.quiet {
+                info!("Command started successfully on boot");
+                let _ = tx
+                    .send("Command started successfully on boot".to_string())
+                    .await;
+            }
             tokio::spawn(monitor_child(web::Data::new(app_state.clone())));
         }
         Err(e) => {
-            error!("Failed to start command on boot: {}", e);
-            let _ = tx
-                .send(format!("Failed to start command on boot: {}", e))
-                .await;
+            if !args.quiet {
+                error!("Failed to start command on boot: {}", e);
+                let _ = tx
+                    .send(format!("Failed to start command on boot: {}", e))
+                    .await;
+            }
         }
     }
 
     let bind_address = format!("{}:{}", args.host, args.port);
-    info!("Attempting to bind to http://{}", bind_address);
+    if !args.quiet {
+        info!("Attempting to bind to http://{}", bind_address);
+    }
 
     match HttpServer::new(move || {
         App::new()
@@ -408,11 +417,15 @@ async fn main() -> std::io::Result<()> {
     .bind(&bind_address)
     {
         Ok(server) => {
-            info!("Server successfully bound to http://{}", bind_address);
+            if !args.quiet {
+                info!("Server successfully bound to http://{}", bind_address);
+            }
             server.run().await
         }
         Err(e) => {
-            error!("Failed to bind to {}: {}", bind_address, e);
+            if !args.quiet {
+                error!("Failed to bind to {}: {}", bind_address, e);
+            }
             Err(e)
         }
     }
