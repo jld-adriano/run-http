@@ -4,10 +4,10 @@ use futures::StreamExt;
 use log::{error, info};
 use std::process::Stdio;
 use std::sync::{Arc, Mutex};
-use tokio::io::{AsyncBufReadExt, BufReader};
+use std::io::Write;
+use tokio::io::AsyncReadExt;
 use tokio::process::{Child, Command as TokioCommand};
 use tokio::sync::mpsc;
-use tokio_stream::wrappers::LinesStream;
 use tokio::time::{sleep, Duration};
 use actix_web::body::MessageBody;
 
@@ -67,16 +67,21 @@ async fn run_command(
     let stdout = child.stdout.take().unwrap();
     let stderr = child.stderr.take().unwrap();
 
-    tokio::spawn(stream_output(
-        LinesStream::new(BufReader::new(stdout).lines()),
-        tx.clone(),
-    ));
-    tokio::spawn(stream_output(
-        LinesStream::new(BufReader::new(stderr).lines()),
-        tx.clone(),
-    ));
+    tokio::spawn(stream_raw_output(stdout, tx.clone()));
+    tokio::spawn(stream_raw_output(stderr, tx.clone()));
 
     Ok(child)
+}
+
+async fn stream_raw_output(mut stream: impl AsyncReadExt + Unpin, tx: mpsc::Sender<String>) {
+    let mut buffer = [0; 1024];
+    while let Ok(n) = stream.read(&mut buffer).await {
+        if n == 0 {
+            break;
+        }
+        let s = String::from_utf8_lossy(&buffer[..n]).to_string();
+        let _ = tx.send(s).await;
+    }
 }
 
 async fn stream_output<S>(mut stream: S, tx: mpsc::Sender<String>)
@@ -85,7 +90,7 @@ where
 {
     while let Some(line) = stream.next().await {
         if let Ok(line) = line {
-            let _ = tx.send(line).await;
+            let _ = tx.send(line + "\n").await;
         }
     }
 }
@@ -370,6 +375,7 @@ async fn main() -> std::io::Result<()> {
         while let Some(line) = rx.recv().await {
             if args.quiet {
                 print!("{}", line);  // Direct passthrough in quiet mode
+                let _ = std::io::stdout().flush();  // Ensure output is flushed immediately
             } else {
                 println!("Output: {}", line);
             }
