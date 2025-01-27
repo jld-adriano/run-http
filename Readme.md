@@ -29,6 +29,7 @@ A CLI tool to run and control commands via http
 * `--restart-condition-sleep <RESTART_CONDITION_SLEEP>` — Sleep duration in milliseconds between restart condition checks
 
   Default value: `300`
+* `--quiet` — Suppress all logging output, only show command output
 
 
 

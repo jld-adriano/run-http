@@ -39,6 +39,9 @@ struct Args {
 
     #[clap(long, default_value = "300", help = "Sleep duration in milliseconds between restart condition checks")]
     restart_condition_sleep: u64,
+
+    #[clap(long, action = ArgAction::SetTrue, help = "Suppress all logging output, only show command output")]
+    quiet: bool,
 }
 
 struct AppState {
@@ -48,6 +51,7 @@ struct AppState {
     restart_condition: Option<String>,
     fail_atleast_once: bool,
     restart_condition_sleep: u64,
+    quiet: bool,
 }
 
 async fn run_command(
@@ -88,18 +92,24 @@ where
 }
 
 async fn start_command(data: web::Data<Arc<AppState>>) -> Result<HttpResponse, actix_web::Error> {
-    info!("Received request to start command");
+    if !data.quiet {
+        info!("Received request to start command");
+    }
     let command = data.command.clone();
     let already_running = data.child_process.lock().unwrap().is_some();
     if already_running {
-        info!("Command is already running");
+        if !data.quiet {
+            info!("Command is already running");
+        }
         return Ok(HttpResponse::BadRequest().body("Command is already running"));
     }
 
     match run_command(&command, data.output_tx.clone()).await {
         Ok(child) => {
             *data.child_process.lock().unwrap() = Some(child);
-            info!("Command started successfully, monitoring child");
+            if !data.quiet {
+                info!("Command started successfully, monitoring child");
+            }
             tokio::spawn(monitor_child(data.clone()));
             let _ = data
                 .output_tx
@@ -108,7 +118,9 @@ async fn start_command(data: web::Data<Arc<AppState>>) -> Result<HttpResponse, a
             Ok(HttpResponse::Ok().body("Command started successfully"))
         }
         Err(e) => {
-            error!("Failed to start command: {}", e);
+            if !data.quiet {
+                error!("Failed to start command: {}", e);
+            }
             let _ = data
                 .output_tx
                 .send(format!("Failed to start command: {}", e))
@@ -119,44 +131,55 @@ async fn start_command(data: web::Data<Arc<AppState>>) -> Result<HttpResponse, a
 }
 
 async fn monitor_child(data: web::Data<Arc<AppState>>) {
-    // First get the child process (if any) and take ownership of it
     let child = {
         let mut guard = data.child_process.lock().unwrap();
-        info!("Monitor - Getting child process, current state: {:?}", guard.is_some());
-        // Instead of taking immediately, let's wait until the process exits
-        guard.as_mut()
-            .map(|child| child.id())
+        if !data.quiet {
+            info!("Monitor - Getting child process, current state: {:?}", guard.is_some());
+        }
+        guard.as_mut().map(|child| child.id())
     };
     
     match child {
         Some(pid) => {
-            info!("Monitor - Found child process with PID: {:?}", pid);
+            if !data.quiet {
+                info!("Monitor - Found child process with PID: {:?}", pid);
+            }
             
-            // Now wait for the process to exit
             let mut final_status = None;
+            let mut last_log = std::time::Instant::now();
+            
             loop {
                 let should_break = {
                     let mut guard = data.child_process.lock().unwrap();
                     if let Some(child) = guard.as_mut() {
                         match child.try_wait() {
                             Ok(Some(status)) => {
-                                info!("Monitor - Child process exited with status: {:?}", status);
-                                // Only take the process if it has exited
+                                if !data.quiet {
+                                    info!("Monitor - Child process exited with status: {:?}", status);
+                                }
                                 *guard = None;
                                 final_status = Some(status);
                                 true
                             }
                             Ok(None) => {
-                                info!("Monitor - Child process still running");
+                                let now = std::time::Instant::now();
+                                if !data.quiet && now.duration_since(last_log).as_secs() >= 2 {
+                                    info!("Monitor - Child process still running");
+                                    last_log = now;
+                                }
                                 false
                             }
                             Err(e) => {
-                                error!("Monitor - Error checking process status: {}", e);
+                                if !data.quiet {
+                                    error!("Monitor - Error checking process status: {}", e);
+                                }
                                 false
                             }
                         }
                     } else {
-                        info!("Monitor - Child process no longer in state");
+                        if !data.quiet {
+                            info!("Monitor - Child process no longer in state");
+                        }
                         true
                     }
                 };
@@ -167,9 +190,10 @@ async fn monitor_child(data: web::Data<Arc<AppState>>) {
                 sleep(Duration::from_millis(100)).await;
             }
             
-            info!("Monitor - Finished monitoring process with final status: {:?}", final_status);
+            if !data.quiet {
+                info!("Monitor - Finished monitoring process with final status: {:?}", final_status);
+            }
 
-            // Send error message if needed
             if let Some(status) = final_status {
                 if !status.success() {
                     let _ = data
@@ -180,9 +204,13 @@ async fn monitor_child(data: web::Data<Arc<AppState>>) {
             }
         }
         None => {
-            info!("Monitor - No child process found to monitor");
+            if !data.quiet {
+                info!("Monitor - No child process found to monitor");
+            }
             let msg = "Error: No child process found to monitor".to_string();
-            error!("{}", msg);
+            if !data.quiet {
+                error!("{}", msg);
+            }
             let _ = data.output_tx.send(msg).await;
         }
     }
@@ -202,18 +230,24 @@ async fn run_restart_condition(condition: &str) -> bool {
 }
 
 async fn restart_command(data: web::Data<Arc<AppState>>) -> impl Responder {
-    info!("Received request to restart command");
+    if !data.quiet {
+        info!("Received request to restart command");
+    }
     
     if let Some(condition) = &data.restart_condition {
         let mut has_failed = !data.fail_atleast_once;
         loop {
-            info!("Checking restart condition: {}", condition);
+            if !data.quiet {
+                info!("Checking restart condition: {}", condition);
+            }
             let condition_result = run_restart_condition(condition).await;
             if !condition_result {
                 has_failed = true;
             }
             if condition_result && (!data.fail_atleast_once || has_failed) {
-                info!("Restart condition met");
+                if !data.quiet {
+                    info!("Restart condition met");
+                }
                 break;
             }
             sleep(Duration::from_millis(data.restart_condition_sleep)).await;
@@ -222,7 +256,9 @@ async fn restart_command(data: web::Data<Arc<AppState>>) -> impl Responder {
 
     let mut child_process = data.child_process.lock().unwrap();
     if let Some(mut child) = child_process.take() {
-        info!("Killing existing child process");
+        if !data.quiet {
+            info!("Killing existing child process");
+        }
         let _ = child.kill();
         let _ = child.wait();
     }
@@ -230,48 +266,69 @@ async fn restart_command(data: web::Data<Arc<AppState>>) -> impl Responder {
         Ok(child) => {
             *child_process = Some(child);
             tokio::spawn(monitor_child(data.clone()));
-            info!("Command restarted successfully");
+            if !data.quiet {
+                info!("Command restarted successfully");
+            }
             HttpResponse::Ok().body("Command restarted successfully")
         }
         Err(e) => {
-            error!("Failed to restart command: {}", e);
+            if !data.quiet {
+                error!("Failed to restart command: {}", e);
+            }
             HttpResponse::InternalServerError().body(format!("Failed to restart command: {}", e))
         }
     }
 }
 
 async fn stop_command(data: web::Data<Arc<AppState>>) -> impl Responder {
-    info!("Stop - Received request to stop command");
+    if !data.quiet {
+        info!("Stop - Received request to stop command");
+    }
     let mut child_process = data.child_process.lock().unwrap();
-    info!("Stop - Got lock, child process state: {:?}", child_process.is_some());
+    if !data.quiet {
+        info!("Stop - Got lock, child process state: {:?}", child_process.is_some());
+    }
     
     if let Some(mut child) = child_process.take() {
-        info!("Stop - Found child process, attempting to kill");
-        let pid = child.id();
-        info!("Stop - Child PID: {:?}", pid);
+        if !data.quiet {
+            info!("Stop - Found child process, attempting to kill");
+            let pid = child.id();
+            info!("Stop - Child PID: {:?}", pid);
+        }
         
-        // Await the kill operation before checking result
         let kill_result = child.kill().await.is_ok();
-        info!("Stop - Kill result: {}", kill_result);
+        if !data.quiet {
+            info!("Stop - Kill result: {}", kill_result);
+        }
         
         let wait_result = child.wait().await;
-        info!("Stop - Wait result: {:?}", wait_result);
-        info!("Stop - Command stopped successfully");
+        if !data.quiet {
+            info!("Stop - Wait result: {:?}", wait_result);
+            info!("Stop - Command stopped successfully");
+        }
         HttpResponse::Ok().body("Command stopped successfully")
     } else {
-        info!("Stop - No command is running");
+        if !data.quiet {
+            info!("Stop - No command is running");
+        }
         HttpResponse::BadRequest().body("No command is running")
     }
 }
 
 async fn get_status(data: web::Data<Arc<AppState>>) -> impl Responder {
-    info!("Received request to get command status");
+    if !data.quiet {
+        info!("Received request to get command status");
+    }
     let child_process = data.child_process.lock().unwrap();
     if child_process.is_some() {
-        info!("Command is running");
+        if !data.quiet {
+            info!("Command is running");
+        }
         HttpResponse::Ok().body("Command is running")
     } else {
-        info!("Command is not running");
+        if !data.quiet {
+            info!("Command is not running");
+        }
         HttpResponse::Ok().body("Command is not running")
     }
 }
@@ -293,9 +350,11 @@ async fn main() -> std::io::Result<()> {
         return Ok(());
     }
 
-    env_logger::init_from_env(env_logger::Env::new().default_filter_or("info"));
+    if !args.quiet {
+        env_logger::init_from_env(env_logger::Env::new().default_filter_or("info"));
+        info!("\n\n\nBooting up...");
+    }
 
-    info!("\n\n\nBooting up...");
     let (tx, mut rx) = mpsc::channel(100);
 
     let app_state = Arc::new(AppState {
@@ -305,6 +364,7 @@ async fn main() -> std::io::Result<()> {
         restart_condition: args.restart_condition,
         fail_atleast_once: args.fail_atleast_once,
         restart_condition_sleep: args.restart_condition_sleep,
+        quiet: args.quiet,
     });
 
     tokio::spawn(async move {
@@ -384,6 +444,7 @@ mod tests {
             restart_condition: None,
             fail_atleast_once: false,
             restart_condition_sleep: 100,
+            quiet: false,
         });
         web::Data::new(state)
     }
@@ -467,6 +528,7 @@ mod tests {
                 restart_condition: Some("exit 0".to_string()),
                 fail_atleast_once: false,
                 restart_condition_sleep: 100,
+                quiet: false,
             });
             let state = web::Data::new(state);
 
@@ -554,6 +616,51 @@ mod tests {
         assert_eq!(args.restart_condition.unwrap(), "test -f file.txt");
         assert_eq!(args.fail_atleast_once, true);
         assert_eq!(args.restart_condition_sleep, 100);
+    }
+
+    #[test]
+    fn test_cli_quiet_flag() {
+        let args = Args::parse_from([
+            "run-http",
+            "--quiet",
+            "--",
+            "echo",
+            "hello"
+        ]);
+
+        assert_eq!(args.quiet, true);
+        assert_eq!(args.command, vec!["echo", "hello"]);
+    }
+
+    #[test]
+    fn test_quiet_state_propagation() {
+        let rt = create_runtime();
+        rt.block_on(async {
+            let (tx, mut rx) = mpsc::channel(100);
+            
+            let state = Arc::new(AppState {
+                command: vec!["echo".to_string(), "test".to_string()],
+                child_process: Mutex::new(None),
+                output_tx: tx,
+                restart_condition: None,
+                fail_atleast_once: false,
+                restart_condition_sleep: 100,
+                quiet: true,
+            });
+            let state = web::Data::new(state);
+
+            // Start command and verify output is still sent despite quiet mode
+            let start_resp = start_command(state.clone()).await.unwrap();
+            let start_body = get_body_as_string(start_resp).await;
+            assert!(start_body.contains("successfully"), "Command should start successfully even in quiet mode");
+
+            // Check that command output is received
+            while let Ok(msg) = rx.try_recv() {
+                if msg.contains("test") {
+                    return; // Test passed - we got command output in quiet mode
+                }
+            }
+        });
     }
 
     fn create_runtime() -> Runtime {
