@@ -10,6 +10,9 @@ use tokio::process::{Child, Command as TokioCommand};
 use tokio::sync::mpsc;
 use tokio::time::{sleep, Duration};
 use actix_web::body::MessageBody;
+use portable_pty::{native_pty_system, CommandBuilder, PtySize};
+use std::io::Read;
+use std::thread;
 
 #[derive(Parser, Debug)]
 #[clap(
@@ -44,9 +47,28 @@ struct Args {
     quiet: bool,
 }
 
+struct PtyChild {
+    child: Box<dyn portable_pty::Child + Send + Sync>,
+    _pair: portable_pty::PtyPair,
+}
+
+impl PtyChild {
+    fn try_wait(&mut self) -> Result<Option<portable_pty::ExitStatus>, std::io::Error> {
+        self.child.try_wait()
+    }
+
+    fn kill(&mut self) -> Result<(), std::io::Error> {
+        self.child.kill()
+    }
+
+    fn wait(&mut self) -> Result<portable_pty::ExitStatus, std::io::Error> {
+        self.child.wait()
+    }
+}
+
 struct AppState {
     command: Vec<String>,
-    child_process: Mutex<Option<Child>>,
+    child_process: Mutex<Option<PtyChild>>,
     output_tx: mpsc::Sender<String>,
     restart_condition: Option<String>,
     fail_atleast_once: bool,
@@ -57,20 +79,48 @@ struct AppState {
 async fn run_command(
     command: &[String],
     tx: mpsc::Sender<String>,
-) -> Result<Child, std::io::Error> {
-    let mut child = TokioCommand::new(&command[0])
-        .args(&command[1..])
-        .stdout(Stdio::piped())
-        .stderr(Stdio::piped())
-        .spawn()?;
+) -> Result<PtyChild, std::io::Error> {
+    let pty_system = native_pty_system();
+    
+    // Create a new pty
+    let pty_pair = pty_system.openpty(PtySize {
+        rows: 24,
+        cols: 80,
+        pixel_width: 0,
+        pixel_height: 0,
+    }).map_err(|e| std::io::Error::new(std::io::ErrorKind::Other, e))?;
 
-    let stdout = child.stdout.take().unwrap();
-    let stderr = child.stderr.take().unwrap();
+    // Set up the command
+    let mut cmd = CommandBuilder::new(&command[0]);
+    cmd.args(&command[1..]);
 
-    tokio::spawn(stream_raw_output(stdout, tx.clone()));
-    tokio::spawn(stream_raw_output(stderr, tx.clone()));
+    // Spawn the command in the pty
+    let child = pty_pair.slave.spawn_command(cmd)
+        .map_err(|e| std::io::Error::new(std::io::ErrorKind::Other, e))?;
 
-    Ok(child)
+    // Get a reader for the pty output
+    let mut reader = pty_pair.master.try_clone_reader()
+        .map_err(|e| std::io::Error::new(std::io::ErrorKind::Other, e))?;
+
+    // Spawn a thread to read from the pty
+    thread::spawn(move || {
+        let mut buffer = [0; 1024];
+        loop {
+            match reader.read(&mut buffer) {
+                Ok(0) => break,
+                Ok(n) => {
+                    let s = String::from_utf8_lossy(&buffer[..n]).to_string();
+                    let _ = tx.blocking_send(s);
+                }
+                Err(_) => break,
+            }
+        }
+    });
+
+    Ok(PtyChild {
+        child,
+        _pair: pty_pair,
+    })
 }
 
 async fn stream_raw_output(mut stream: impl AsyncReadExt + Unpin, tx: mpsc::Sender<String>) {
@@ -135,87 +185,65 @@ async fn start_command(data: web::Data<Arc<AppState>>) -> Result<HttpResponse, a
 }
 
 async fn monitor_child(data: web::Data<Arc<AppState>>) {
-    let child = {
-        let mut guard = data.child_process.lock().unwrap();
-        if !data.quiet {
-            info!("Monitor - Getting child process, current state: {:?}", guard.is_some());
-        }
-        guard.as_mut().map(|child| child.id())
-    };
+    if !data.quiet {
+        info!("Monitor - Getting child process");
+    }
     
-    match child {
-        Some(pid) => {
-            if !data.quiet {
-                info!("Monitor - Found child process with PID: {:?}", pid);
-            }
-            
-            let mut final_status = None;
-            let mut last_log = std::time::Instant::now();
-            
-            loop {
-                let should_break = {
-                    let mut guard = data.child_process.lock().unwrap();
-                    if let Some(child) = guard.as_mut() {
-                        match child.try_wait() {
-                            Ok(Some(status)) => {
-                                if !data.quiet {
-                                    info!("Monitor - Child process exited with status: {:?}", status);
-                                }
-                                *guard = None;
-                                final_status = Some(status);
-                                true
-                            }
-                            Ok(None) => {
-                                let now = std::time::Instant::now();
-                                if !data.quiet && now.duration_since(last_log).as_secs() >= 2 {
-                                    info!("Monitor - Child process still running");
-                                    last_log = now;
-                                }
-                                false
-                            }
-                            Err(e) => {
-                                if !data.quiet {
-                                    error!("Monitor - Error checking process status: {}", e);
-                                }
-                                false
-                            }
-                        }
-                    } else {
+    let mut final_status = None;
+    let mut last_log = std::time::Instant::now();
+    
+    loop {
+        let should_break = {
+            let mut guard = data.child_process.lock().unwrap();
+            if let Some(pty_child) = guard.as_mut() {
+                match pty_child.try_wait() {
+                    Ok(Some(status)) => {
                         if !data.quiet {
-                            info!("Monitor - Child process no longer in state");
+                            info!("Monitor - Child process exited with status: {:?}", status);
                         }
+                        *guard = None;
+                        final_status = Some(status);
                         true
                     }
-                };
-
-                if should_break {
-                    break;
+                    Ok(None) => {
+                        let now = std::time::Instant::now();
+                        if !data.quiet && now.duration_since(last_log).as_secs() >= 2 {
+                            info!("Monitor - Child process still running");
+                            last_log = now;
+                        }
+                        false
+                    }
+                    Err(e) => {
+                        if !data.quiet {
+                            error!("Monitor - Error checking process status: {}", e);
+                        }
+                        false
+                    }
                 }
-                sleep(Duration::from_millis(100)).await;
-            }
-            
-            if !data.quiet {
-                info!("Monitor - Finished monitoring process with final status: {:?}", final_status);
-            }
-
-            if let Some(status) = final_status {
-                if !status.success() {
-                    let _ = data
-                        .output_tx
-                        .send(format!("Command exited with error: {:?}", status))
-                        .await;
+            } else {
+                if !data.quiet {
+                    info!("Monitor - Child process no longer in state");
                 }
+                true
             }
+        };
+
+        if should_break {
+            break;
         }
-        None => {
-            if !data.quiet {
-                info!("Monitor - No child process found to monitor");
-            }
-            let msg = "Error: No child process found to monitor".to_string();
-            if !data.quiet {
-                error!("{}", msg);
-            }
-            let _ = data.output_tx.send(msg).await;
+        sleep(Duration::from_millis(100)).await;
+    }
+    
+    if !data.quiet {
+        info!("Monitor - Finished monitoring process with final status: {:?}", final_status);
+    }
+
+    if let Some(status) = final_status {
+        if !status.success() {
+            let _ = data
+                .output_tx
+                .send(format!("Command exited with error: {:?}", status))
+                .await;
         }
     }
 }
@@ -296,16 +324,14 @@ async fn stop_command(data: web::Data<Arc<AppState>>) -> impl Responder {
     if let Some(mut child) = child_process.take() {
         if !data.quiet {
             info!("Stop - Found child process, attempting to kill");
-            let pid = child.id();
-            info!("Stop - Child PID: {:?}", pid);
         }
         
-        let kill_result = child.kill().await.is_ok();
+        let kill_result = child.kill();
         if !data.quiet {
-            info!("Stop - Kill result: {}", kill_result);
+            info!("Stop - Kill result: {:?}", kill_result);
         }
         
-        let wait_result = child.wait().await;
+        let wait_result = child.wait();
         if !data.quiet {
             info!("Stop - Wait result: {:?}", wait_result);
             info!("Stop - Command stopped successfully");
@@ -442,6 +468,8 @@ mod tests {
     use super::*;
     use tokio::runtime::Runtime;
     use actix_web::test::TestRequest;
+    use std::sync::mpsc as std_mpsc;
+    use std::time::Duration as StdDuration;
 
     // Helper function to get response body as string
     async fn get_body_as_string(resp: impl Responder) -> String {
@@ -679,6 +707,100 @@ mod tests {
                     return; // Test passed - we got command output in quiet mode
                 }
             }
+        });
+    }
+
+    #[test]
+    fn test_pty_preserves_colors() {
+        let rt = create_runtime();
+        rt.block_on(async {
+            let (tx, mut rx) = mpsc::channel(100);
+            let (output_tx, output_rx) = std_mpsc::channel();
+            
+            // Spawn a task to collect output
+            tokio::spawn(async move {
+                while let Some(line) = rx.recv().await {
+                    output_tx.send(line).unwrap();
+                }
+            });
+
+            // Run a command that outputs colors
+            let command = vec!["echo".to_string(), "-e".to_string(), "\x1b[31mred\x1b[0m".to_string()];
+            let _child = run_command(&command, tx).await.expect("Failed to start command");
+
+            // Wait a bit for output
+            thread::sleep(StdDuration::from_millis(100));
+
+            // Check that the output contains ANSI color codes
+            let output = output_rx.try_iter().collect::<Vec<_>>().join("");
+            assert!(output.contains("\x1b[31m"), "Output should contain color codes");
+            assert!(output.contains("\x1b[0m"), "Output should contain color reset codes");
+        });
+    }
+
+    #[test]
+    fn test_pty_handles_interactive_programs() {
+        let rt = create_runtime();
+        rt.block_on(async {
+            let (tx, mut rx) = mpsc::channel(100);
+            let (output_tx, output_rx) = std_mpsc::channel();
+            
+            tokio::spawn(async move {
+                while let Some(line) = rx.recv().await {
+                    output_tx.send(line).unwrap();
+                }
+            });
+
+            // Python with sys.stdout.isatty() check
+            let command = vec![
+                "python3".to_string(),
+                "-c".to_string(),
+                "import sys; print('isatty:', sys.stdout.isatty())".to_string()
+            ];
+            let _child = run_command(&command, tx).await.expect("Failed to start command");
+
+            thread::sleep(StdDuration::from_millis(100));
+
+            let output = output_rx.try_iter().collect::<Vec<_>>().join("");
+            assert!(output.contains("isatty: True"), "Python should detect it's running in a TTY");
+        });
+    }
+
+    #[test]
+    fn test_quiet_mode_exact_passthrough() {
+        let rt = create_runtime();
+        rt.block_on(async {
+            let (tx, mut rx) = mpsc::channel(100);
+            let (output_tx, output_rx) = std_mpsc::channel();
+            
+            // Set up output collection
+            tokio::spawn(async move {
+                while let Some(line) = rx.recv().await {
+                    output_tx.send(line).unwrap();
+                }
+            });
+
+            // Test with special characters and colors
+            let command = vec![
+                "printf".to_string(),
+                "\x1b[31mcolored\x1b[0m\ntext".to_string()
+            ];
+            let _child = run_command(&command, tx).await.expect("Failed to start command");
+
+            thread::sleep(StdDuration::from_millis(100));
+
+            let output = output_rx.try_iter().collect::<Vec<_>>().join("");
+            
+            // Verify content is preserved
+            assert!(output.contains("\x1b[31m"), "ANSI color codes should be preserved");
+            assert!(output.contains("\x1b[0m"), "ANSI reset codes should be preserved");
+            assert!(output.contains("colored"), "Text content should be preserved");
+            assert!(output.contains("text"), "Multiple lines should be preserved");
+            
+            // Verify no modifications
+            assert!(!output.contains("Output:"), "No prefix should be added");
+            assert!(!output.contains("[INFO]"), "No logging should be included");
+            assert!(!output.contains("Command"), "No command info should be included");
         });
     }
 

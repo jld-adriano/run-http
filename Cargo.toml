@@ -12,6 +12,7 @@ env_logger = "0.9"
 clap = { version = "4.0", features = ["derive"] }
 clap-markdown = "0.1"
 tokio-stream = { version = "0.1", features = ["io-util"] }
+portable-pty = "0.8"
 
 [dev-dependencies]
 tokio-test = "0.4"
